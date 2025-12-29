@@ -1,0 +1,16 @@
+[Unit]
+Description=tp_etcd
+After=network.target
+
+[Service]
+User=root
+Type=notify
+EnvironmentFile={{HA_TP_DIR}}/tp_etcd/tp_etcd.env 
+ExecStart={{HA_TP_DIR}}/tp_etcd/bin/etcd
+NotifyAccess=all
+RestartSec=10s
+LimitNOFILE=40000
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

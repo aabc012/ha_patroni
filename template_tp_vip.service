@@ -1,0 +1,14 @@
+[Unit]
+Description=Manages Virtual IP for Patroni
+After=network-online.target
+Before=patroni.service
+
+[Service]
+Type=simple
+
+ExecStart={{HA_TP_DIR}}/tp_vip/vip-manager --config {{HA_TP_DIR}}/tp_vip/vip_manager.yml
+
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

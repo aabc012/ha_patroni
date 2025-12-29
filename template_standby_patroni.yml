@@ -1,0 +1,76 @@
+scope: pieclouddb-tp
+namespace: pie_cluster
+name: pie_node{{LOACL_NUM}}
+restapi:
+  listen: 0.0.0.0:8008
+  connect_address: {{LOCAL_IP}}:8008
+etcd3:
+  hosts:
+{{ETCD_CLI_LIST}}
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+    standby_cluster:
+      host: {{PRIMARY_CLUSTER_VIP}}
+      port: {{PRIMARY_CLUSTER_PG_PORT}}
+      primary_slot_name: {{PRIMARY_SLOT_NAME}}
+      create_replica_methods:
+      - basebackup
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+        max_connections: 500
+        superuser_reserved_connections: 20
+        max_locks_per_transaction: 64
+        max_worker_processes: 2
+        maintenance_work_mem: 128MB
+        work_mem: 8MB
+        max_prepared_transactions: 0
+        wal_level: logical
+        shared_buffers: 1GB
+        wal_log_hints: on
+        track_commit_timestamp: off
+        max_wal_senders: 10
+        max_replication_slots: 10
+        shared_preload_libraries: "pdb_nn"
+        wal_keep_size: 1024MB
+        archive_mode: on
+        archive_command: "cp %p {{TP_ARCH}}/%f"
+        logging_collector: on
+        log_directory: {{TP_DATA}}/log
+  initdb:
+  - encoding: UTF8
+  - data-checksums
+  pg_hba:
+  - host replication replica 0.0.0.0/0 md5
+  - host all all 0.0.0.0/0 md5
+  users:
+    replica:
+      password: replica
+      options:
+        - createrole
+        - replication
+    openpie:
+      password: openpie
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: {{LOCAL_IP}}:5432
+  data_dir: {{TP_DATA}}
+  bin_dir: /opt/pieclouddb-tp/bin/
+  pgpass: /tmp/pgpass
+  authentication:
+    replication:
+      username: replica
+      password: replica
+    superuser:
+      username: openpie
+      password: openpie
+tags:
+    nofailover: false
+    noloadbalance: false
+    clonefrom: false
+    nosync: false

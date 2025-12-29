@@ -1,0 +1,14 @@
+ip: {{VIP}}
+netmask: {{NETMASK}}
+interface: {{INTERFACE}}
+trigger-key: /pie_cluster/pieclouddb-tp/leader
+trigger-value: pie_node{{LOACL_NUM}}
+hosting-type: basic
+dcs-type: etcd
+dcs-endpoints:
+  - http://127.0.0.1:{{CLI_PORT}}
+  - http://{{LOCAL_IP}}:{{CLI_PORT}}
+retry-num: 2
+retry-after: 250
+verbose: false
+interval: 1000

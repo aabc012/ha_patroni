@@ -1,0 +1,23 @@
+[Unit]
+Description=patroni
+After=network.target remote-fs.target nss-lookup.target tp_etcd.service
+Requires=tp_etcd.service
+
+[Service]
+Type=simple
+User=openpie
+Group=openpie
+Environment="PGHOME=/opt/pieclouddb-tp/"
+Environment="PGDATA=/data/pie_data"
+Environment="PGPORT=5432"
+Environment="LD_LIBRARY_PATH=/opt/pieclouddb-tp/lib"
+Environment="PATH=/opt/pieclouddb-tp/bin:/usr/local/sbin:/usr/"
+ExecStart=/opt/miniconda3/envs/py311/bin/patroni /opt/ha_pieclouddb_tp/patroni/patroni.yml
+ExecReload=/bin/kill -s HUP $MAINPID
+ExecStop=/usr/bin/killall patroni
+KillMode=process
+TimeoutSec=30
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

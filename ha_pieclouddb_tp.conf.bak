@@ -1,0 +1,26 @@
+
+# ha_piecloudb_tp的部署目录
+ha_tp_dir=/opt/ha_piecloudb_tp
+
+# ip和host的顺序需要一一对应
+export ip_list="192.168.20.71,192.168.20.72,192.168.20.73"
+export host_list="host71,host72,host73"
+
+## etcd config
+export cli_port=12379
+export peer_port=12380
+
+
+## tp database data dir config
+export tp_data=/data/pie_data
+
+## tp_vip config
+export interface=enp0s5
+export vip=192.168.20.74
+
+
+## primary cluster vip,只在配置standby cluster 时需要配置
+export primary_cluster_vip=192.168.20.60
+export primary_cluster_pg_port=5432
+export primary_cluster_pg_password=openpie
+export primary_slot_name=standby01
