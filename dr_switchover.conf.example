@@ -1,0 +1,19 @@
+# Copy this file twice: one for each physical cluster. Do not use the same file
+# as a running install config unless its values already match that cluster.
+ha_tp_dir=/opt/ha_pieclouddb_tp
+# Must match `scope` in patroni.yml. It is used only by emergency-promote.
+patroni_scope=pieclouddb-tp
+ip_list="10.0.0.11,10.0.0.12,10.0.0.13"
+host_list="pg-a1,pg-a2,pg-a3"
+tp_data=/data/pie_data
+vip=10.0.0.100
+
+# Port advertised by this cluster when it becomes the upstream. A slot name is
+# consumed when this cluster is rebuilt as a standby after a cutover.
+primary_cluster_pg_port=5432
+primary_slot_name=dr_cluster_a
+primary_cluster_pg_password=openpie
+
+# Optional. Password used locally by the promote phase to create a replication
+# slot. If absent, primary_cluster_pg_password is used for compatibility.
+# superuser_password=openpie
