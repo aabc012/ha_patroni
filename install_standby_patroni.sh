@@ -3,6 +3,56 @@
 set -e
 source ./ha_pieclouddb_tp.conf
 
+: "${primary_cluster_vip:?missing primary_cluster_vip (primary cluster VIP)}"
+: "${primary_cluster_pg_port:?missing primary_cluster_pg_port}"
+: "${primary_cluster_pg_password:?missing primary_cluster_pg_password}"
+: "${primary_slot_name:?missing primary_slot_name}"
+[[ "$primary_cluster_pg_port" =~ ^[0-9]+$ ]] || {
+  echo "primary_cluster_pg_port must be a positive integer" >&2
+  exit 1
+}
+[[ "$primary_slot_name" =~ ^[a-zA-Z0-9_]+$ ]] || {
+  echo "primary_slot_name contains unsafe characters: $primary_slot_name" >&2
+  exit 1
+}
+
+PSQL=${PSQL:-/opt/pieclouddb-tp/bin/psql}
+PDB_ENV=${PDB_ENV:-/opt/pieclouddb-tp/pdb_env.sh}
+[[ -r "$PDB_ENV" ]] || { echo "PDB_ENV is not readable: $PDB_ENV" >&2; exit 1; }
+
+# The standby cluster depends on this slot on the current primary. Create it
+# before starting Patroni and make the operation safe to repeat.
+set +u
+source "$PDB_ENV"
+set -u
+export PGPASSWORD="$primary_cluster_pg_password"
+"$PSQL" \
+  -h "$primary_cluster_vip" \
+  -p "$primary_cluster_pg_port" \
+  -U openpie \
+  -d postgres \
+  -v ON_ERROR_STOP=1 \
+  -c "SELECT pg_create_physical_replication_slot('${primary_slot_name}')
+      WHERE NOT EXISTS (
+        SELECT 1 FROM pg_replication_slots
+        WHERE slot_name = '${primary_slot_name}'
+      );" >/dev/null
+
+slot_exists=$("$PSQL" \
+  -h "$primary_cluster_vip" \
+  -p "$primary_cluster_pg_port" \
+  -U openpie \
+  -d postgres \
+  -At \
+  -v ON_ERROR_STOP=1 \
+  -c "SELECT 1 FROM pg_replication_slots
+      WHERE slot_name = '${primary_slot_name}';")
+[[ "$slot_exists" == 1 ]] || {
+  echo "replication slot $primary_slot_name was not found on $primary_cluster_vip:$primary_cluster_pg_port" >&2
+  exit 1
+}
+echo "Verified replication slot $primary_slot_name on $primary_cluster_vip:$primary_cluster_pg_port"
+
 #tp_rpm="pieclouddb-tp-2.9.9-96ee068498.20240801_ky10.x86_64.rpm"
 tp_rpm="pieclouddb-tp-2.16.0-4552651248.20250930_el8.x86_64.rpm"
 
@@ -45,12 +95,6 @@ do
   # 分发patroni 服务配置文件
   scp patroni.service ${host_arr[$i]}:/usr/lib/systemd/system/patroni.service
 done
-
-# 主集群创建slot
-. /opt/pieclouddb-tp/pdb_env.sh
-export PGPASSWORD=${primary_cluster_pg_password}
-psql postgres -U openpie -h ${primary_cluster_vip} -c "SELECT * FROM pg_create_physical_replication_slot('$primary_slot_name');"
-
 
 for (( i=0;i<$len;i++ ))
 do

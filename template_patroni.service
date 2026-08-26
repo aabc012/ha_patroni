@@ -15,8 +15,9 @@ Environment="PATH=/opt/pieclouddb-tp/bin:/usr/local/sbin:/usr/"
 ExecStart=/opt/miniconda3/envs/py311/bin/patroni {{HA_TP_DIR}}/patroni/patroni.yml
 ExecReload=/bin/kill -s HUP $MAINPID
 ExecStop=/usr/bin/killall patroni
-KillMode=process
-TimeoutSec=30
+# Ensure Patroni's PostgreSQL child is stopped with the service as well.
+KillMode=control-group
+TimeoutStopSec=90
 Restart=on-failure
 
 [Install]

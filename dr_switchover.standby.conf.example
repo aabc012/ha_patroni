@@ -1,0 +1,15 @@
+# Current standby cluster: 10.24.11.232-234
+ha_tp_dir=/opt/ha_pieclouddb_tp
+patroni_scope=pieclouddb-tp
+ip_list="10.24.11.232,10.24.11.233,10.24.11.234"
+host_list="host232,host233,host234"
+tp_data=/data/pie_data
+vip=10.24.11.221
+
+# Peer primary cluster VIP.
+peer_cluster_vip=10.24.11.201
+peer_cluster_pg_port=5432
+
+# B consumes dr_cluster_b from A; A consumes dr_cluster_a after B is promoted.
+local_replication_slot_name=dr_cluster_b
+peer_replication_slot_name=dr_cluster_a

@@ -1,0 +1,15 @@
+# Current primary cluster: 10.24.11.158-160
+ha_tp_dir=/opt/ha_pieclouddb_tp
+patroni_scope=pieclouddb-tp
+ip_list="10.24.11.158,10.24.11.159,10.24.11.160"
+host_list="host158,host159,host160"
+tp_data=/data/pie_data
+vip=10.24.11.201
+
+# Peer standby cluster VIP.
+peer_cluster_vip=10.24.11.221
+peer_cluster_pg_port=5432
+
+# A consumes dr_cluster_a when it rejoins; B consumes dr_cluster_b from A.
+local_replication_slot_name=dr_cluster_a
+peer_replication_slot_name=dr_cluster_b
