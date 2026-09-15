@@ -1,8 +1,21 @@
 #!/usr/bin/env bash
 # Execute one DR switchover phase on the local Patroni cluster.
+#
+# This script deliberately implements one phase per invocation.  A normal
+# switchover is performed in this order:
+#   1. fence   - stop writes on the current primary cluster;
+#   2. promote - convert the current standby cluster into a primary;
+#   3. rejoin  - rebuild the former primary as the new standby.
+#
+# The commands must be run from the operations host for the cluster named by
+# --conf.  The operations host only needs passwordless root SSH access to its
+# own cluster; the peer is reached through its VIP for PostgreSQL checks.
 
 set -Eeuo pipefail
 
+# Print the supported phases and the operational assumptions.  In particular,
+# emergency-promote is intentionally not a fencing operation: the old primary
+# must be isolated outside this script before it is used.
 usage() {
   cat <<'EOF'
 Usage:
@@ -38,12 +51,9 @@ EOF
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
-confirm() {
-  local word=$1 answer
-  read -r -p "Type $word to continue: " answer
-  [[ "$answer" == "$word" ]] || die 'operation cancelled'
-}
 
+# The first positional argument selects exactly one state transition.  The
+# remaining arguments are parsed separately so that --conf can appear after it.
 stage=${1:-}
 [[ -n "$stage" ]] && shift || true
 if [[ "$stage" == -h || "$stage" == --help ]]; then
@@ -68,8 +78,12 @@ PDB_ENV=${PDB_ENV:-/opt/pieclouddb-tp/pdb_env.sh}
 WAIT_SECONDS=${WAIT_SECONDS:-180}
 MAX_PREFLIGHT_LAG_BYTES=${MAX_PREFLIGHT_LAG_BYTES:-16777216}
 MAX_SWITCHOVER_LAG_BYTES=${MAX_SWITCHOVER_LAG_BYTES:-0}
+# These values are embedded in remote commands/SQL, so reject non-numeric
+# timeout and lag settings before any cluster operation begins.
 [[ "$WAIT_SECONDS" =~ ^[0-9]+$ && "$MAX_PREFLIGHT_LAG_BYTES" =~ ^[0-9]+$ && "$MAX_SWITCHOVER_LAG_BYTES" =~ ^[0-9]+$ ]] || die 'wait and lag settings must be non-negative integers'
 
+# Clear variables before sourcing the configuration.  This prevents values
+# inherited from the caller's shell from silently filling missing config keys.
 unset ip_list host_list tp_data vip peer_cluster_vip peer_cluster_pg_port local_replication_slot_name peer_replication_slot_name patroni_scope
 unset primary_cluster_vip primary_cluster_pg_port
 # shellcheck disable=SC1090
@@ -79,6 +93,7 @@ if [[ -n ${primary_cluster_vip:-} || -n ${primary_cluster_pg_port:-} ]]; then
 fi
 IFS=',' read -r -a hosts <<< "${host_list:?missing host_list in $conf}"
 IFS=',' read -r -a ips <<< "${ip_list:?missing ip_list in $conf}"
+# host_list is used for SSH; ip_list is retained as a topology sanity check.
 ((${#hosts[@]} == ${#ips[@]})) || die "$conf: ip_list and host_list differ in length"
 data_dir=${tp_data:?missing tp_data in $conf}
 cluster_vip=${vip:?missing vip in $conf}
@@ -87,13 +102,19 @@ peer_pg_port=${peer_cluster_pg_port:?missing peer_cluster_pg_port in $conf}
 local_slot_name=${local_replication_slot_name:?missing local_replication_slot_name in $conf}
 peer_slot_name=${peer_replication_slot_name:?missing peer_replication_slot_name in $conf}
 expected_scope=${patroni_scope:-pieclouddb-tp}
+# Values are later passed through SSH, shell snippets, and SQL.  Keep the
+# accepted alphabet deliberately narrow; slot names are checked again by
+# safe_value() at the point where they are used.
 safe_config_pattern='^[a-zA-Z0-9._:/-]+$'
 [[ "$cluster_vip" =~ $safe_config_pattern && "$peer_vip" =~ $safe_config_pattern && "$peer_pg_port" =~ ^[0-9]+$ && "$local_slot_name" =~ ^[a-zA-Z0-9_]+$ && "$peer_slot_name" =~ ^[a-zA-Z0-9_]+$ && "$expected_scope" =~ ^[a-zA-Z0-9_.-]+$ ]] || die "$conf contains an unsafe DR configuration value"
 ha_dir=$(awk -F= '/^[[:space:]]*(export[[:space:]]+)?ha_tp_dir=/{gsub(/["[:space:]]/, "", $2); print $2; exit}' "$conf")
 ha_dir=${ha_dir:-/opt/ha_pieclouddb_tp}
 patroni_conf="$ha_dir/patroni/patroni.yml"
+# The first reachable node is used as the control node for patronictl, DCS,
+# REST API, and peer-VIP connectivity checks.  It is not assumed to be leader.
 control_host=${hosts[0]}
 
+# BatchMode prevents an interactive password prompt from hanging an operation.
 ssh_root() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$@"; }
 stop_vip_node() { ssh_root "$1" 'systemctl stop tp_vip 2>/dev/null || true'; }
 stop_cluster_node() {
@@ -108,7 +129,8 @@ systemctl stop patroni 2>/dev/null || true
 cd /
 
 # Some existing patroni.service files use KillMode=process, which leaves the
-# PostgreSQL child process running after Patroni exits. Stop this exact PGDATA.
+# PostgreSQL child process running after Patroni exits. Stop this exact PGDATA
+# explicitly, then verify that no process still owns it.
 if [ -f "$data_dir/postmaster.pid" ]; then
   runuser -u openpie -- "$pg_ctl" -D "$data_dir" stop -m fast -w -t 90
 fi
@@ -120,7 +142,11 @@ REMOTE
 }
 patronictl() { ssh_root "$control_host" "$PATRONICTL -c '$patroni_conf' $*"; }
 cluster_json() { patronictl list -f json; }
+# Read the static scope from the deployed Patroni file and compare it with the
+# operation config before touching the cluster's DCS state.
 cluster_scope() { ssh_root "$control_host" "awk -F ': *' '/^scope:/ {print \$2; exit}' '$patroni_conf'"; }
+# Patroni's /config endpoint exposes the effective dynamic DCS configuration,
+# which is more authoritative than the local YAML file during a live run.
 dynamic_config() { ssh_root "$control_host" 'curl --fail --silent --show-error http://127.0.0.1:8008/config'; }
 assert_primary_cluster_config() {
   dynamic_config | python3 -c '
@@ -187,6 +213,7 @@ wait_for_primary_host() {
   done
   return 1
 }
+# This is called before values are interpolated into shell commands or SQL.
 safe_value() { [[ "$1" =~ ^[a-zA-Z0-9._:/-]+$ ]] || die "unsafe configuration value: $1"; }
 complete_promotion() {
   local primary
@@ -220,7 +247,8 @@ test -r "$pdb_env"
 test -r "$patroni_conf"
 pg_password=$(awk '/^    superuser:/{found=1; next} found && /^      password:/{print $2; exit}' "$patroni_conf")
 test -n "$pg_password"
-# pdb_env.sh provides the TP library path required by psql.
+# pdb_env.sh provides the TP library path required by psql.  The password is
+# read from the deployed Patroni config rather than stored in the DR config.
 # shellcheck disable=SC1090
 set +u
 source "$pdb_env"
@@ -236,7 +264,7 @@ slot_exists=$("$psql_bin" -h 127.0.0.1 -U openpie -d postgres -At -v ON_ERROR_ST
 }
 REMOTE
 }
-verify_upstream() {
+prepare_upstream() {
   local upstream=$1 port=$2 slot=$3
   safe_value "$upstream"; safe_value "$port"; safe_value "$slot"
   ssh_root "$control_host" bash -s -- "$PSQL" "$upstream" "$port" "$slot" "$PDB_ENV" "$patroni_conf" <<'REMOTE'
@@ -251,10 +279,26 @@ set +u
 source "$pdb_env"
 set -u
 export PGPASSWORD="$pg_password"
-result=$("$psql_bin" -h "$upstream" -p "$port" -U openpie -d postgres -At -v ON_ERROR_STOP=1 \
-  -c "SELECT (NOT pg_is_in_recovery()) AND EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '${slot}');")
-[[ "$result" == t ]] || {
-  echo "Upstream $upstream:$port is not writable or lacks replication slot $slot" >&2
+is_writable=$("$psql_bin" -h "$upstream" -p "$port" -U openpie -d postgres -At -v ON_ERROR_STOP=1 \
+  -c "SELECT NOT pg_is_in_recovery();")
+[[ "$is_writable" == t ]] || {
+  echo "Upstream $upstream:$port is not writable" >&2
+  exit 1
+}
+slot_state=$("$psql_bin" -h "$upstream" -p "$port" -U openpie -d postgres -At -v ON_ERROR_STOP=1 \
+  -c "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '${slot}') THEN 'missing' WHEN EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '${slot}' AND slot_type = 'physical' AND NOT temporary) THEN 'ready' ELSE 'incompatible' END;")
+if [[ "$slot_state" == missing ]]; then
+  echo "Replication slot $slot is absent on $upstream:$port; creating it before rejoin."
+  "$psql_bin" -h "$upstream" -p "$port" -U openpie -d postgres -v ON_ERROR_STOP=1 \
+    -c "SELECT pg_create_physical_replication_slot('${slot}');" >/dev/null
+elif [[ "$slot_state" != ready ]]; then
+  echo "Upstream slot $slot exists but is not a permanent physical replication slot" >&2
+  exit 1
+fi
+slot_ready=$("$psql_bin" -h "$upstream" -p "$port" -U openpie -d postgres -At -v ON_ERROR_STOP=1 \
+  -c "SELECT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '${slot}' AND slot_type = 'physical' AND NOT temporary);")
+[[ "$slot_ready" == t ]] || {
+  echo "Physical replication slot $slot is not ready on $upstream:$port" >&2
   exit 1
 }
 REMOTE
@@ -272,6 +316,8 @@ set +u
 source "$pdb_env"
 set -u
 export PGPASSWORD="$pg_password"
+# Join the slot to its active replication connection so an existing but
+# unused slot is not mistaken for a healthy standby.
 result=$("$psql_bin" -h 127.0.0.1 -U openpie -d postgres -At -v ON_ERROR_STOP=1 -c \
   "SELECT COALESCE((SELECT r.state = 'streaming' AND pg_wal_lsn_diff(pg_current_wal_lsn(), r.replay_lsn) <= ${max_lag} FROM pg_replication_slots s JOIN pg_stat_replication r ON r.pid = s.active_pid WHERE s.slot_name = '${slot}'), false);")
 [[ "$result" == t ]]
@@ -319,6 +365,10 @@ REMOTE
 }
 
 reachable_hosts=()
+# Validate SSH and the VIP-manager configuration on every local node before
+# asking Patroni for cluster state.  emergency-promote is the only phase that
+# tolerates unreachable local nodes; it still requires at least one reachable
+# node and a usable DCS quorum/standby leader.
 for host in "${hosts[@]}"; do
   if ! ssh_root "$host" true; then
     if [[ "$stage" == emergency-promote ]]; then
@@ -338,6 +388,8 @@ actual_scope=$(cluster_scope)
 
 case "$stage" in
   fence)
+    # Planned switchover: stop the writable cluster only after its peer is
+    # healthy and within the configured preflight lag limit.
     scope=$actual_scope
     assert_primary_cluster_config
     assert_cluster_healthy writable
@@ -346,11 +398,12 @@ case "$stage" in
     peer_replication_is_streaming "$leader" "$peer_slot_name" "$MAX_PREFLIGHT_LAG_BYTES" || \
       die "peer slot $peer_slot_name is absent, inactive, not streaming, or lag exceeds ${MAX_PREFLIGHT_LAG_BYTES} bytes"
     log "Fencing writable leader $leader and stopping this cluster."
-    confirm FENCE
     log "Stopping VIP $cluster_vip before the final replication catch-up."
     for host in "${hosts[@]}"; do
       stop_vip_node "$host"
     done
+    # Pause failover while the old primary is being shut down.  If catch-up
+    # times out, the VIP stays down and PostgreSQL is intentionally left up.
     patronictl pause --wait
     log "Waiting for peer slot $peer_slot_name to catch up within ${MAX_SWITCHOVER_LAG_BYTES} bytes."
     wait_for_peer_catchup "$leader" "$peer_slot_name" || \
@@ -362,6 +415,8 @@ case "$stage" in
     ;;
 
   promote)
+    # Planned promotion: the old primary must already be fenced, and this
+    # standby must have replayed all WAL it received before becoming writable.
     [[ "$peer_vip" != "$cluster_vip" ]] || die "$conf: peer_cluster_vip must point to the other cluster"
     leader=$(leader_host) || die 'standby cluster has no reachable leader'
     role_is "$leader" "('standby_leader', 'standby leader')" || die "$leader is not a standby leader"
@@ -376,7 +431,9 @@ case "$stage" in
     fi
     log "Former primary VIP $peer_vip:$peer_pg_port is not accepting database connections."
     log "Promoting standby leader $leader. The old primary must already be fenced."
-    confirm PROMOTE
+    # Removing standby_cluster is a Patroni DCS change.  Pause first so the
+    # transition cannot race with an election; resume afterwards to let
+    # Patroni elect the new writable leader.
     patronictl pause --wait
     ssh_root "$leader" "curl --fail --silent --show-error -X PATCH -H 'Content-Type: application/json' --data '{\"standby_cluster\": null}' http://127.0.0.1:8008/config" >/dev/null
     patronictl resume --wait
@@ -387,12 +444,14 @@ case "$stage" in
     ;;
 
   emergency-promote)
+    # Emergency path for an unreachable primary.  No network probe can prove
+    # the old primary is down here, so isolation at the infrastructure layer
+    # is an explicit prerequisite and is not attempted by this script.
     [[ "$peer_vip" != "$cluster_vip" ]] || die "$conf: peer_cluster_vip must point to the other cluster"
     leader=$(leader_host) || die 'standby cluster has no reachable leader'
     role_is "$leader" "('standby_leader', 'standby leader')" || die "$leader is not a standby leader"
     assert_standby_cluster_config "$peer_vip" "$local_slot_name"
-    log "EMERGENCY promotion of $leader. Confirm former primary VIP $peer_vip is fenced outside this script."
-    confirm EMERGENCY
+    log "EMERGENCY promotion of $leader. Former primary VIP $peer_vip must already be isolated at the network, storage, host, or VIP layer."
     patronictl pause --wait
     ssh_root "$leader" "curl --fail --silent --show-error -X PATCH -H 'Content-Type: application/json' --data '{\"standby_cluster\": null}' http://127.0.0.1:8008/config" >/dev/null
     patronictl resume --wait
@@ -403,25 +462,30 @@ case "$stage" in
     ;;
 
   finalize-promote)
+    # Recovery path for a promotion that completed but was interrupted before
+    # the return replication slot was created.
     primary=$(primary_host) || die 'this cluster has no writable leader to finalize'
     log "Completing promotion on existing primary $primary."
-    confirm FINALIZE
     complete_promotion
     log 'Promotion finalization complete. The former primary can now run rejoin.'
     ;;
 
   rejoin)
+    # Rebuild the former primary from the new primary.  The upstream preflight
+    # is intentionally before any local stop, DCS removal, or data-directory
+    # rename so a failed connectivity/slot check is non-destructive.
     [[ "$peer_vip" != "$cluster_vip" ]] || die "$conf: peer_cluster_vip must point to the other cluster"
     scope=$actual_scope
-    log "Verifying new primary $peer_vip:$peer_pg_port and local rejoin slot $local_slot_name before local reset."
-    verify_upstream "$peer_vip" "$peer_pg_port" "$local_slot_name" || die 'new primary preflight failed; local data was not changed'
+    log "Verifying new primary $peer_vip:$peer_pg_port and preparing local rejoin slot $local_slot_name before local reset."
+    prepare_upstream "$peer_vip" "$peer_pg_port" "$local_slot_name" || die 'new primary preflight failed; local data was not changed'
     log "Resetting this former primary and rebuilding it from $peer_vip:$peer_pg_port."
-    confirm REJOIN
-    # The fence phase must have stopped all nodes; repeat it defensively before DCS removal.
+    # The fence phase must have stopped all nodes; repeat it defensively before
+    # DCS removal because this phase may also follow emergency-promote.
     for host in "${hosts[@]}"; do
       stop_cluster_node "$host"
     done
     remove_cluster_from_dcs "$scope"
+    # Keep timestamped copies of both config and data for forensic recovery.
     timestamp=$(date '+%Y%m%d_%H%M%S')
     for host in "${hosts[@]}"; do
       ssh_root "$host" bash -s -- "$patroni_conf" "$data_dir" "$peer_vip" "$peer_pg_port" "$local_slot_name" "$timestamp" <<'REMOTE'
@@ -430,6 +494,9 @@ config=$1 data_dir=$2 upstream_host=$3 upstream_port=$4 slot=$5 stamp=$6
 cp -a "$config" "${config}.before_dr_${stamp}"
 tmp=$(mktemp)
 awk -v host="$upstream_host" -v port="$upstream_port" -v slot="$slot" '
+  # Replace any old standby_cluster block and insert the new upstream below
+  # bootstrap.dcs, immediately before postgresql.  The basebackup method then
+  # lets Patroni initialize the freshly created data directory.
   /^    standby_cluster:/ { skipping=1; next }
   skipping && /^    [^ ]/ { skipping=0 }
   skipping { next }

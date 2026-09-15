@@ -10,6 +10,8 @@ vip=10.24.11.221
 peer_cluster_vip=10.24.11.201
 peer_cluster_pg_port=5432
 
-# B consumes dr_cluster_b from A; A consumes dr_cluster_a after B is promoted.
-local_replication_slot_name=dr_cluster_b
-peer_replication_slot_name=dr_cluster_a
+# B currently consumes A's dr_cluster_a slot as a standby.
+# After B is promoted, it creates dr_cluster_b for A to consume when A
+# rejoins as the standby cluster.
+local_replication_slot_name=dr_cluster_a
+peer_replication_slot_name=dr_cluster_b

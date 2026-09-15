@@ -12,11 +12,21 @@ vip=10.0.0.100
 peer_cluster_vip=10.0.1.100
 peer_cluster_pg_port=5432
 
-# Directional slot names are intentionally different. This cluster consumes
-# local_replication_slot_name when it is rebuilt from the peer. After this
-# cluster is promoted, it creates peer_replication_slot_name for the peer.
-local_replication_slot_name=dr_cluster_a
-peer_replication_slot_name=dr_cluster_b
+# Slot names are associated with the cluster that is currently writable:
+#   * cluster A (10.24.11.158-160) uses dr_cluster_a as its upstream slot;
+#   * cluster B (10.24.11.232-234) uses dr_cluster_b as its upstream slot.
+#
+# The values below are for a file describing cluster A while A is primary.
+# If this template is used for cluster B while B is standby, use instead:
+#   local_replication_slot_name=dr_cluster_a
+#   peer_replication_slot_name=dr_cluster_b
+#
+# local_replication_slot_name is the slot consumed when this cluster is
+# rebuilt as a standby. peer_replication_slot_name is the slot consumed by
+# the peer while this cluster is primary, and the slot created after this
+# cluster is promoted.
+local_replication_slot_name=dr_cluster_b
+peer_replication_slot_name=dr_cluster_a
 
 # Database passwords are read from the deployed Patroni configuration and are
 # not stored in this DR configuration.

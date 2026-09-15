@@ -18,6 +18,28 @@ systemctl status tp_vip
 /opt/miniconda3/envs/py311/bin/patronictl -c /opt/ha_pieclouddb_tp/patroni/patroni.yml list
 ```
 
+## 更新 TP 域名解析并重启业务服务
+
+仓库提供 `update_coredns_and_restart.sh`，用于更新 Kubernetes `kube-system/coredns`
+ConfigMap 中的 hosts 记录，并自动重启 CoreDNS 及依赖该解析的业务 Deployment。
+脚本使用当前 `kubectl` context，不保存或传递 root 密码；执行账号需要具备相应 Kubernetes 权限。
+
+默认更新 `tp.example.internal`：
+
+```bash
+chmod 750 update_coredns_and_restart.sh
+./update_coredns_and_restart.sh 10.24.11.221
+```
+
+域名变更为 `tp.patroni.internal` 后，将域名作为第二个参数传入：
+
+```bash
+./update_coredns_and_restart.sh 10.24.11.221 tp.patroni.internal
+```
+
+脚本会等待以下 Deployment 的 rollout 完成：`coredns`、`openpie-account/ops-account`、
+`openpie-ops/timertask` 和 `openpie-polaris/authzutil`。
+
 ## 使用注意事项
 
 **主备集群都是如下要求：**
@@ -51,7 +73,19 @@ systemctl status tp_vip
 按上面的注意事项准备备集群安装环境，主备集群之间所有服务器的网络需互通
 
 ### 2. 配置文件修改
-修改 `ha_pieclouddb_tp.con` 配置文件，特别是对备集群各主机名、IP 和虚拟 IP 使用网口及其 IP 的修改，还有连接主集群的信息
+修改 `ha_pieclouddb_tp.conf` 配置文件，特别是备集群各主机名、IP、VIP、网卡，以及连接主集群的信息。当前环境采用“槽名跟随当前可写集群”的约定：集群 A（`10.24.11.158-160`）作为主集群时使用 `dr_cluster_a`，集群 B（`10.24.11.232-234`）作为主集群时使用 `dr_cluster_b`。
+
+首次初始化集群 B、且集群 A 仍为当前主集群时，关键配置如下：
+
+```bash
+export primary_cluster_vip=10.24.11.201
+export primary_cluster_pg_port=5432
+export primary_cluster_pg_password=Openpie_123456
+# B initially consumes the slot hosted by current primary A.
+export primary_slot_name=dr_cluster_a
+```
+
+`primary_slot_name` 表示备集群连接当前主集群时使用的槽名，槽实际创建在当前主集群上。初始化完成后，预期关系为：A 上的 `dr_cluster_a` 被 B 使用。
 
 ### 3. 执行安装
 执行方式为：
@@ -87,7 +121,7 @@ systemctl status tp_vip
 standby_cluster:
   host: 主集群VIP或IP
   port: 5432
-  primary_slot_name: standby01
+  primary_slot_name: dr_cluster_a
   create_replica_methods:
   - basebackup
 ```
@@ -101,7 +135,7 @@ standby_cluster:
 
 仓库提供 `dr_switchover.sh` 用于两个 Patroni 集群之间的计划切换。命令分别在两套集群自己的运维机上执行，每台运维机只需以 root SSH 免密访问本集群节点；不需要能同时访问两套集群的公共运维机。
 
-当前环境可直接从 `dr_switchover.primary.conf.example` 和 `dr_switchover.standby.conf.example` 复制配置。通用模板为 `dr_switchover.conf.example`。两套环境的方向性配置如下：
+当前环境可直接参考或复制 `dr_switchover.primary.conf.example` 和 `dr_switchover.standby.conf.example`；两个示例已按下表的槽名关系填写。通用模板为 `dr_switchover.conf.example`，复制时需根据它描述的是集群 A 还是集群 B 设置槽字段。两套环境的配置如下：
 
 | 配置 | 主集群 A | 备集群 B |
 | --- | --- | --- |
@@ -109,10 +143,39 @@ standby_cluster:
 | 本集群 VIP | `10.24.11.201` | `10.24.11.221` |
 | `peer_cluster_vip` | `10.24.11.221` | `10.24.11.201` |
 | `peer_cluster_pg_port` | `5432` | `5432` |
-| `local_replication_slot_name` | `dr_cluster_a` | `dr_cluster_b` |
-| `peer_replication_slot_name` | `dr_cluster_b` | `dr_cluster_a` |
+| `local_replication_slot_name` | `dr_cluster_b` | `dr_cluster_a` |
+| `peer_replication_slot_name` | `dr_cluster_a` | `dr_cluster_b` |
 
-`local_replication_slot_name` 是本集群重建为备集群时在对端使用的槽；`peer_replication_slot_name` 是对端重建时需要本集群创建的槽。数据库密码由脚本从已部署的 Patroni 配置读取，不写入 DR 配置文件。
+这里的槽名固定归属于集群，不随主备角色改变：集群 A 作为当前主集群时，A 上的 `dr_cluster_a` 被 B 使用；集群 B 提升为主集群后，B 上的 `dr_cluster_b` 被 A 使用。
+
+`local_replication_slot_name` 是本集群将来重建为备集群时需要在新主上使用的槽；`peer_replication_slot_name` 是本集群作为当前主集群时由对端使用、或提升完成后需要为对端创建的槽。因此：
+
+- A 的配置为 `local=dr_cluster_b`、`peer=dr_cluster_a`；
+- B 的配置为 `local=dr_cluster_a`、`peer=dr_cluster_b`。
+
+数据库密码由脚本从已部署的 Patroni 配置读取，不写入 DR 切换配置文件。
+
+因此，两个切换配置文件中的关键字段应明确写成：
+
+`dr_switchover.primary.conf`（集群 A，当前主集群）：
+
+```bash
+peer_cluster_vip=10.24.11.221
+peer_cluster_pg_port=5432
+local_replication_slot_name=dr_cluster_b
+peer_replication_slot_name=dr_cluster_a
+```
+
+`dr_switchover.standby.conf`（集群 B，当前备集群）：
+
+```bash
+peer_cluster_vip=10.24.11.201
+peer_cluster_pg_port=5432
+local_replication_slot_name=dr_cluster_a
+peer_replication_slot_name=dr_cluster_b
+```
+
+初始状态下，A 上的 `dr_cluster_a` 必须处于 `active` 且 `streaming`，B 的 DCS 中应为 `primary_slot_name: dr_cluster_a`。B 提升为主集群并完成 `promote` 后，脚本会在 B 上创建 `dr_cluster_b`；随后 A 的 `rejoin` 使用该槽重建为备集群。
 
 切换会执行以下不可逆运维动作：暂停并停止当前可写集群以防止双主，停止 VIP；提升备集群；最后清理旧集群的 Patroni DCS 状态，备份其 Patroni 配置，将旧集群每个节点的数据目录重命名为 `*.before_dr_<时间戳>`，并通过 `basebackup` 重建为新主集群的备集群。
 
@@ -124,7 +187,7 @@ chmod 750 dr_switchover.sh
   --conf ./dr_switchover.primary.conf
 ```
 
-`fence` 会在停止 VIP 前验证 `dr_cluster_b` 槽存在、处于活动流复制状态且延迟不超过 `MAX_PREFLIGHT_LAG_BYTES`（默认 16 MiB）。停止业务 VIP 后会等待延迟降到 `MAX_SWITCHOVER_LAG_BYTES`（默认 `0`），确认后才停止 Patroni 和 PostgreSQL。复制不健康时不会进入停库阶段。
+`fence` 会在停止 VIP 前验证当前主集群 A 上的 `dr_cluster_a` 槽存在、处于活动流复制状态且延迟不超过 `MAX_PREFLIGHT_LAG_BYTES`（默认 16 MiB）。停止业务 VIP 后会等待延迟降到 `MAX_SWITCHOVER_LAG_BYTES`（默认 `0`），确认后才停止 Patroni 和 PostgreSQL。复制不健康时不会进入停库阶段。
 
 2. 在集群 B 的运维机执行提升和复制槽创建：
 
@@ -133,7 +196,7 @@ chmod 750 dr_switchover.sh
   --conf ./dr_switchover.standby.conf
 ```
 
-`promote` 会验证 DCS 中的上游 VIP 和本集群槽名、确认已回放所有收到的 WAL，并探测 A 的数据库 VIP；如果原主仍可连接，脚本会拒绝提升。提升完成后，B 自动创建 A 回接使用的 `dr_cluster_a` 槽。
+`promote` 会验证 DCS 中的上游 VIP 和本集群槽名、确认已回放所有收到的 WAL，并探测 A 的数据库 VIP；如果原主仍可连接，脚本会拒绝提升。提升完成后，B 自动创建供 A 回接使用的 `dr_cluster_b` 槽。
 
 3. 在集群 A 的运维机执行数据目录重置和备集群重建：
 
@@ -144,7 +207,7 @@ chmod 750 dr_switchover.sh
 
 回切前应确认新主集群和重建后的旧集群均健康、复制延迟可接受。反向执行相同流程即可：在当前可写的 B 执行 `fence`，在当前只读的 A 执行 `promote`，最后回到 B 执行 `rejoin`。
 
-三个命令分别要求输入 `FENCE`、`PROMOTE`、`REJOIN`。任一步失败时脚本退出并保持旧写入端停止，避免恢复旧写入端导致双主；此时先检查 Patroni、VIP 和备份，再决定人工恢复或重新执行。执行前应进行业务停写和一致性确认，脚本不保证跨集群零数据丢失。
+切换命令完成前置检查后会直接执行，不需要输入确认文字。任一步失败时脚本退出并保持旧写入端停止，避免恢复旧写入端导致双主；此时先检查 Patroni、VIP 和备份，再决定人工恢复或重新执行。执行前应进行业务停写和一致性确认，脚本不保证跨集群零数据丢失。
 
 `fence` 和 `rejoin` 会同时停止 Patroni 与指定 `tp_data` 的 PostgreSQL 主进程，并通过 `pg_ctl status` 验证实例已退出。旧版 `patroni.service` 若使用 `KillMode=process`，仅执行 `systemctl stop patroni` 不能停止 PostgreSQL；新的服务模板已改为 `KillMode=control-group`。
 
@@ -163,11 +226,11 @@ Patroni 在移除 `standby_cluster` 后可能由集群内任意节点成为新�
   --conf ./dr_switchover.standby.conf
 ```
 
-该命令从 B 的配置读取原主 VIP 和方向性槽名，提升 B 并创建 A 重建时使用的 `dr_cluster_a` 槽。故障主集群恢复且确认不应保留原数据服务后，在 A 执行：
+该命令从 B 的配置读取原主 VIP 和方向性槽名，提升 B 并创建 A 重建时使用的 `dr_cluster_b` 槽。故障主集群恢复且确认不应保留原数据服务后，在 A 执行：
 
 ```bash
 ./dr_switchover.sh rejoin \
   --conf ./dr_switchover.primary.conf
 ```
 
-`rejoin` 会先连接 A 配置中的 `peer_cluster_vip`，确认 B 可写且 `dr_cluster_a` 槽存在；验证通过后才停止 A、将原数据目录重命名保留为 `*.before_dr_<时间戳>`，再以 B 为上游进行 `basebackup` 重建。应急提升发生在复制延迟未知的情况下，可能丢失尚未复制到 B 的事务。
+`rejoin` 会先连接 A 配置中的 `peer_cluster_vip` 并确认 B 可写。如果 `dr_cluster_b` 槽缺失，脚本会在 B 的当前主节点上自动创建物理复制槽并复核；检查或创建失败时不会修改 A 的本地数据。验证通过后才停止 A、将原数据目录重命名保留为 `*.before_dr_<时间戳>`，再以 B 为上游进行 `basebackup` 重建。应急提升发生在复制延迟未知的情况下，可能丢失尚未复制到 B 的事务。
