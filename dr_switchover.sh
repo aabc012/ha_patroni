@@ -28,7 +28,11 @@ Usage:
 Run each phase from the operations host for that cluster. It must have
 passwordless root SSH access to every node in the local cluster.
 
-Each configuration defines two directional slots: local_replication_slot_name
+When SSH_USER is not root, that user must have passwordless sudo (sudo -n)
+on every target node; the remote operations still require root privileges.
+
+Each configuration defines a comma-separated ip_list for the local nodes and
+two directional slots: local_replication_slot_name
 is consumed when this cluster rejoins as a standby; peer_replication_slot_name
 is consumed by the other cluster and is created here after promotion. The
 peer_cluster_vip and peer_cluster_pg_port always identify the other cluster,
@@ -42,6 +46,8 @@ run stopped before it could create the return replication slot.
 
 Optional environment variables:
   PATRONICTL=/path/to/patronictl   (default: /opt/miniconda3/envs/py311/bin/patronictl)
+  SSH_USER=openpie               (default: current execution user)
+  PYTHON=/path/to/python         (default: python3, used for JSON parsing in this Pod)
   PSQL=/path/to/psql               (default: /opt/pieclouddb-tp/bin/psql)
   WAIT_SECONDS=180                 (default: 180)
   MAX_PREFLIGHT_LAG_BYTES=16777216 (default: 16 MiB)
@@ -75,26 +81,33 @@ PATRONICTL=${PATRONICTL:-/opt/miniconda3/envs/py311/bin/patronictl}
 PSQL=${PSQL:-/opt/pieclouddb-tp/bin/psql}
 PG_CTL=${PG_CTL:-/opt/pieclouddb-tp/bin/pg_ctl}
 PDB_ENV=${PDB_ENV:-/opt/pieclouddb-tp/pdb_env.sh}
+SSH_USER=${SSH_USER:-${USER:-root}}
+PYTHON=${PYTHON:-python3}
 WAIT_SECONDS=${WAIT_SECONDS:-180}
 MAX_PREFLIGHT_LAG_BYTES=${MAX_PREFLIGHT_LAG_BYTES:-16777216}
 MAX_SWITCHOVER_LAG_BYTES=${MAX_SWITCHOVER_LAG_BYTES:-0}
 # These values are embedded in remote commands/SQL, so reject non-numeric
 # timeout and lag settings before any cluster operation begins.
 [[ "$WAIT_SECONDS" =~ ^[0-9]+$ && "$MAX_PREFLIGHT_LAG_BYTES" =~ ^[0-9]+$ && "$MAX_SWITCHOVER_LAG_BYTES" =~ ^[0-9]+$ ]] || die 'wait and lag settings must be non-negative integers'
+command -v ssh >/dev/null 2>&1 || die 'ssh is required in the execution Pod'
+command -v awk >/dev/null 2>&1 || die 'awk is required in the execution Pod'
+command -v "$PYTHON" >/dev/null 2>&1 || die "JSON parser not found: $PYTHON; install Python 3 or set PYTHON=/path/to/python"
+[[ "$SSH_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "invalid SSH_USER: $SSH_USER"
 
 # Clear variables before sourcing the configuration.  This prevents values
 # inherited from the caller's shell from silently filling missing config keys.
-unset ip_list host_list tp_data vip peer_cluster_vip peer_cluster_pg_port local_replication_slot_name peer_replication_slot_name patroni_scope
+unset ip_list tp_data vip peer_cluster_vip peer_cluster_pg_port local_replication_slot_name peer_replication_slot_name patroni_scope
 unset primary_cluster_vip primary_cluster_pg_port
 # shellcheck disable=SC1090
 source "$conf"
 if [[ -n ${primary_cluster_vip:-} || -n ${primary_cluster_pg_port:-} ]]; then
   die "$conf uses obsolete primary_cluster_* fields; rename them to peer_cluster_vip and peer_cluster_pg_port"
 fi
-IFS=',' read -r -a hosts <<< "${host_list:?missing host_list in $conf}"
-IFS=',' read -r -a ips <<< "${ip_list:?missing ip_list in $conf}"
-# host_list is used for SSH; ip_list is retained as a topology sanity check.
-((${#hosts[@]} == ${#ips[@]})) || die "$conf: ip_list and host_list differ in length"
+IFS=',' read -r -a nodes <<< "${ip_list:?missing ip_list in $conf}"
+for node in "${nodes[@]}"; do
+  [[ "$node" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "$conf contains an invalid node IP: $node"
+done
+(( ${#nodes[@]} > 0 )) || die "$conf must contain at least one node IP"
 data_dir=${tp_data:?missing tp_data in $conf}
 cluster_vip=${vip:?missing vip in $conf}
 peer_vip=${peer_cluster_vip:?missing peer_cluster_vip in $conf}
@@ -112,10 +125,24 @@ ha_dir=${ha_dir:-/opt/ha_pieclouddb_tp}
 patroni_conf="$ha_dir/patroni/patroni.yml"
 # The first reachable node is used as the control node for patronictl, DCS,
 # REST API, and peer-VIP connectivity checks.  It is not assumed to be leader.
-control_host=${hosts[0]}
+control_host=${nodes[0]}
 
 # BatchMode prevents an interactive password prompt from hanging an operation.
-ssh_root() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$@"; }
+# Non-root SSH users need passwordless sudo because the remote phases stop
+# services, edit system configuration, and move PostgreSQL data directories.
+ssh_root() {
+  local host=$1
+  shift
+  if [[ "$SSH_USER" == root ]]; then
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "root@$host" "$@"
+  elif [[ "${1:-}" == bash && "${2:-}" == -s ]]; then
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "$SSH_USER@$host" sudo -n "$@"
+  else
+    # Feed the command as a script so embedded quotes (REST JSON, SQL, awk)
+    # survive the SSH and remote shell boundaries.
+    printf '%s\n' "$*" | ssh -o BatchMode=yes -o ConnectTimeout=10 "$SSH_USER@$host" sudo -n bash -s
+  fi
+}
 stop_vip_node() { ssh_root "$1" 'systemctl stop tp_vip 2>/dev/null || true'; }
 stop_cluster_node() {
   local host=$1
@@ -140,7 +167,18 @@ if runuser -u openpie -- "$pg_ctl" -D "$data_dir" status >/dev/null 2>&1; then
 fi
 REMOTE
 }
-patronictl() { ssh_root "$control_host" "$PATRONICTL -c '$patroni_conf' $*"; }
+patronictl() {
+  # Keep stdin attached to patronictl.  `patronictl remove` is interactive;
+  # routing the command through `sudo bash -s` would consume its confirmation
+  # input in the remote shell and make patronictl report `Aborted!`.
+  if [[ "$SSH_USER" == root ]]; then
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "root@$control_host" \
+      "$PATRONICTL" -c "$patroni_conf" "$@"
+  else
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "$SSH_USER@$control_host" \
+      sudo -n "$PATRONICTL" -c "$patroni_conf" "$@"
+  fi
+}
 cluster_json() { patronictl list -f json; }
 # Read the static scope from the deployed Patroni file and compare it with the
 # operation config before touching the cluster's DCS state.
@@ -149,7 +187,7 @@ cluster_scope() { ssh_root "$control_host" "awk -F ': *' '/^scope:/ {print \$2; 
 # which is more authoritative than the local YAML file during a live run.
 dynamic_config() { ssh_root "$control_host" 'curl --fail --silent --show-error http://127.0.0.1:8008/config'; }
 assert_primary_cluster_config() {
-  dynamic_config | python3 -c '
+  dynamic_config | "$PYTHON" -c '
 import json, sys
 if json.load(sys.stdin).get("standby_cluster"):
     raise SystemExit("DCS still configures this cluster as a standby")
@@ -157,7 +195,7 @@ if json.load(sys.stdin).get("standby_cluster"):
 }
 assert_standby_cluster_config() {
   local expected_host=$1 expected_slot=$2
-  dynamic_config | python3 -c '
+  dynamic_config | "$PYTHON" -c '
 import json, sys
 expected_host, expected_slot = sys.argv[1:]
 standby = json.load(sys.stdin).get("standby_cluster") or {}
@@ -166,7 +204,7 @@ if str(standby.get("host", "")) != expected_host or standby.get("primary_slot_na
 ' "$expected_host" "$expected_slot" || die "DCS standby configuration does not match $expected_host / $expected_slot"
 }
 leader_host() {
-  cluster_json | python3 -c '
+  cluster_json | "$PYTHON" -c '
 import json, sys
 for member in json.load(sys.stdin):
     if member.get("Role", "").lower() in ("leader", "primary", "master", "standby leader", "standby_leader"):
@@ -174,7 +212,7 @@ for member in json.load(sys.stdin):
 else: raise SystemExit("No leader found")'
 }
 primary_host() {
-  cluster_json | python3 -c '
+  cluster_json | "$PYTHON" -c '
 import json, sys
 for member in json.load(sys.stdin):
     if member.get("Role", "").lower() in ("leader", "primary", "master"):
@@ -182,8 +220,8 @@ for member in json.load(sys.stdin):
 else: raise SystemExit("No writable leader found")'
 }
 assert_cluster_healthy() {
-  local expected_leader_role=$1 expected_count=${#hosts[@]}
-  cluster_json | python3 -c '
+  local expected_leader_role=$1 expected_count=${#nodes[@]}
+  cluster_json | "$PYTHON" -c '
 import json, sys
 expected_role, expected_count = sys.argv[1], int(sys.argv[2])
 members = json.load(sys.stdin)
@@ -198,8 +236,8 @@ if any(state not in {"running", "streaming"} for state in states):
 }
 role_is() {
   local host=$1 expected=$2
-  ssh_root "$host" 'curl --fail --silent --show-error http://127.0.0.1:8008/patroni' | \
-    python3 -c "import json,sys; raise SystemExit(0 if json.load(sys.stdin).get('role') in ${expected} else 1)"
+    ssh_root "$host" 'curl --fail --silent --show-error http://127.0.0.1:8008/patroni' | \
+    "$PYTHON" -c "import json,sys; raise SystemExit(0 if json.load(sys.stdin).get('role') in ${expected} else 1)"
 }
 wait_for_primary_host() {
   local elapsed=0 host
@@ -222,11 +260,24 @@ complete_promotion() {
   create_replication_slot "$primary" "$peer_slot_name"
 }
 remove_cluster_from_dcs() {
-  local scope=$1 attempt
+  local scope=$1 attempt members leader_member confirmations
   # Patroni 3.3.x has no --force option. A recently stopped leader lease may
-  # cause a third confirmation prompt; retry until its TTL expires.
+  # cause a third confirmation prompt; retry until its TTL expires. An empty
+  # member list does not imply empty DCS state: initialize/config/status keys
+  # may remain after member leases expire, so always issue remove here.
   for attempt in 1 2 3 4 5; do
-    if printf '%s\n%s\n' "$scope" 'Yes I am aware' | patronictl remove "$scope"; then
+    members=$(patronictl list -f json) || die "unable to inspect Patroni DCS members for $scope"
+    leader_member=$(printf '%s\n' "$members" | "$PYTHON" -c '
+import json, sys
+leaders = {"leader", "primary", "master", "standby leader", "standby_leader"}
+for member in json.load(sys.stdin):
+    if member.get("Role", "").lower() in leaders:
+        print(member.get("Member", ""))
+        break
+' ) || die "unable to identify the current Patroni leader for $scope"
+    confirmations=$(printf '%s\n%s\n' "$scope" 'Yes I am aware')
+    [[ -z "$leader_member" ]] || confirmations+=$(printf '\n%s' "$leader_member")
+    if printf '%s\n' "$confirmations" | patronictl remove "$scope"; then
       return 0
     fi
     log "DCS removal is waiting for the former leader lease to expire (attempt $attempt/5)."
@@ -369,7 +420,7 @@ reachable_hosts=()
 # asking Patroni for cluster state.  emergency-promote is the only phase that
 # tolerates unreachable local nodes; it still requires at least one reachable
 # node and a usable DCS quorum/standby leader.
-for host in "${hosts[@]}"; do
+for host in "${nodes[@]}"; do
   if ! ssh_root "$host" true; then
     if [[ "$stage" == emergency-promote ]]; then
       log "WARNING: local cluster node $host is unreachable during emergency promotion."
@@ -399,7 +450,7 @@ case "$stage" in
       die "peer slot $peer_slot_name is absent, inactive, not streaming, or lag exceeds ${MAX_PREFLIGHT_LAG_BYTES} bytes"
     log "Fencing writable leader $leader and stopping this cluster."
     log "Stopping VIP $cluster_vip before the final replication catch-up."
-    for host in "${hosts[@]}"; do
+    for host in "${nodes[@]}"; do
       stop_vip_node "$host"
     done
     # Pause failover while the old primary is being shut down.  If catch-up
@@ -408,7 +459,7 @@ case "$stage" in
     log "Waiting for peer slot $peer_slot_name to catch up within ${MAX_SWITCHOVER_LAG_BYTES} bytes."
     wait_for_peer_catchup "$leader" "$peer_slot_name" || \
       die "peer did not catch up within ${WAIT_SECONDS}s; VIP is stopped but PostgreSQL remains running"
-    for host in "${hosts[@]}"; do
+    for host in "${nodes[@]}"; do
       stop_cluster_node "$host"
     done
     log 'Fence complete. On the standby cluster, run: ./dr_switchover.sh promote --conf <standby.conf>'
@@ -475,19 +526,35 @@ case "$stage" in
     # is intentionally before any local stop, DCS removal, or data-directory
     # rename so a failed connectivity/slot check is non-destructive.
     [[ "$peer_vip" != "$cluster_vip" ]] || die "$conf: peer_cluster_vip must point to the other cluster"
+    # Re-running rejoin against an already healthy standby would otherwise
+    # stop it and move its freshly seeded PGDATA again. Treat that state as a
+    # successful no-op.
+    if cluster_json | "$PYTHON" -c '
+import json, sys
+expected = int(sys.argv[1])
+members = json.load(sys.stdin)
+healthy = len(members) == expected and all(
+    m.get("Role", "").lower() in ("replica", "standby leader", "standby_leader")
+    and m.get("State", "").lower() in ("running", "streaming")
+    for m in members)
+raise SystemExit(0 if healthy else 1)' "${#nodes[@]}"; then
+      assert_standby_cluster_config "$peer_vip" "$local_slot_name"
+      log 'This cluster is already a healthy standby; rejoin is not needed.'
+      exit 0
+    fi
     scope=$actual_scope
     log "Verifying new primary $peer_vip:$peer_pg_port and preparing local rejoin slot $local_slot_name before local reset."
     prepare_upstream "$peer_vip" "$peer_pg_port" "$local_slot_name" || die 'new primary preflight failed; local data was not changed'
     log "Resetting this former primary and rebuilding it from $peer_vip:$peer_pg_port."
     # The fence phase must have stopped all nodes; repeat it defensively before
     # DCS removal because this phase may also follow emergency-promote.
-    for host in "${hosts[@]}"; do
+    for host in "${nodes[@]}"; do
       stop_cluster_node "$host"
     done
     remove_cluster_from_dcs "$scope"
     # Keep timestamped copies of both config and data for forensic recovery.
     timestamp=$(date '+%Y%m%d_%H%M%S')
-    for host in "${hosts[@]}"; do
+    for host in "${nodes[@]}"; do
       ssh_root "$host" bash -s -- "$patroni_conf" "$data_dir" "$peer_vip" "$peer_pg_port" "$local_slot_name" "$timestamp" <<'REMOTE'
 set -Eeuo pipefail
 config=$1 data_dir=$2 upstream_host=$3 upstream_port=$4 slot=$5 stamp=$6
@@ -521,7 +588,7 @@ REMOTE
     log "Waiting for this cluster to initialize as a standby."
     elapsed=0
     while ((elapsed < WAIT_SECONDS)); do
-      if cluster_json | python3 -c '
+      if cluster_json | "$PYTHON" -c '
 import json,sys
 expected=int(sys.argv[1])
 members=json.load(sys.stdin)
@@ -529,7 +596,7 @@ healthy=len(members) == expected and all(
     m.get("Role", "").lower() in ("replica", "standby leader", "standby_leader")
     and m.get("State", "").lower() in ("running", "streaming")
     for m in members)
-raise SystemExit(0 if healthy else 1)' "${#hosts[@]}"; then
+raise SystemExit(0 if healthy else 1)' "${#nodes[@]}"; then
         log 'Rejoin complete.'
         exit 0
       fi

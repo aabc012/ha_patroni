@@ -6,14 +6,15 @@ set -Eeuo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  ./update_coredns_and_restart.sh <new-ip> [domain]
+  bash ./update_coredns_and_restart.sh <new-ip> [domain]
 
 Examples:
   ./update_coredns_and_restart.sh 10.24.11.221
   ./update_coredns_and_restart.sh 10.24.11.221 tp.patroni.internal
 
-The script uses the current kubectl context and requires permission to update
-the kube-system/coredns ConfigMap and restart the listed Deployments.
+The script uses /app/configs/standby_kubeconfig by default, which is the
+mounted kubeconfig for the Kubernetes cluster hosting this DR server. Override
+it with KUBECONFIG if needed.
 EOF
 }
 
@@ -25,6 +26,9 @@ new_ip=${1:-}
 domain=${2:-tp.example.internal}
 [[ -n "$new_ip" ]] || { usage >&2; exit 2; }
 [[ $# -le 2 ]] || die 'too many arguments'
+KUBECONFIG=${KUBECONFIG:-/app/configs/standby_kubeconfig}
+export KUBECONFIG
+[[ -r "$KUBECONFIG" ]] || die "kubeconfig is not readable: $KUBECONFIG"
 
 # Validate values before putting them into a shell or Python expression.
 python3 - "$new_ip" "$domain" <<'PY'

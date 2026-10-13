@@ -133,13 +133,23 @@ standby_cluster:
 
 ## 主备集群切换与回切
 
-仓库提供 `dr_switchover.sh` 用于两个 Patroni 集群之间的计划切换。命令分别在两套集群自己的运维机上执行，每台运维机只需以 root SSH 免密访问本集群节点；不需要能同时访问两套集群的公共运维机。
+可使用 `tp_cluster_status.sh` 从统一运维 Pod 检查主备集群状态。参数为
+`primary` 或 `standby`，脚本分别读取同目录下的
+`dr_switchover.primary.conf`、`dr_switchover.standby.conf`，并按 `ip_list`
+顺序尝试 SSH；节点不可达时自动尝试下一个节点，全部不可达时返回异常：
+
+```bash
+./tp_cluster_status.sh primary
+./tp_cluster_status.sh standby
+```
+
+仓库提供 `dr_switchover.sh` 用于两个 Patroni 集群之间的计划切换。命令可在两套集群自己的运维机上执行，也可在具备到两套集群 root SSH 免密访问能力的统一运维 Pod 中执行。DR 配置中的 `ip_list` 直接用于 SSH 和节点遍历，不再需要 `host_list`。
 
 当前环境可直接参考或复制 `dr_switchover.primary.conf.example` 和 `dr_switchover.standby.conf.example`；两个示例已按下表的槽名关系填写。通用模板为 `dr_switchover.conf.example`，复制时需根据它描述的是集群 A 还是集群 B 设置槽字段。两套环境的配置如下：
 
 | 配置 | 主集群 A | 备集群 B |
 | --- | --- | --- |
-| 节点 | `10.24.11.158-160` | `10.24.11.232-234` |
+| 节点（`ip_list`） | `10.24.11.158-160` | `10.24.11.232-234` |
 | 本集群 VIP | `10.24.11.201` | `10.24.11.221` |
 | `peer_cluster_vip` | `10.24.11.221` | `10.24.11.201` |
 | `peer_cluster_pg_port` | `5432` | `5432` |

@@ -3,7 +3,6 @@
 ha_tp_dir=/opt/ha_pieclouddb_tp
 patroni_scope=pieclouddb-tp
 ip_list="10.0.0.11,10.0.0.12,10.0.0.13"
-host_list="pg-a1,pg-a2,pg-a3"
 tp_data=/data/pie_data
 vip=10.0.0.100
 
