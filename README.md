@@ -136,7 +136,7 @@ standby_cluster:
 可使用 `tp_cluster_status.sh` 从统一运维 Pod 检查主备集群状态。参数为
 `primary` 或 `standby`，脚本分别读取同目录下的
 `dr_switchover.primary.conf`、`dr_switchover.standby.conf`，并按 `ip_list`
-顺序尝试 SSH；节点不可达时自动尝试下一个节点，全部不可达时返回异常：
+顺序尝试 SSH 和 `patronictl`；节点不可达或远程状态命令失败时自动尝试下一个节点，全部节点都无法返回状态时返回异常：
 
 ```bash
 ./tp_cluster_status.sh primary

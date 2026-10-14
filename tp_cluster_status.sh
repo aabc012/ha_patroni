@@ -11,8 +11,9 @@ Usage:
 
 The script reads dr_switchover.primary.conf or
 dr_switchover.standby.conf from its own directory and tries each node in
-ip_list until SSH succeeds. It prints the patronictl cluster status and exits
-non-zero if no node is reachable or the remote status command fails.
+ip_list until the remote patronictl command succeeds. It continues past
+unreachable nodes and nodes where sudo/patronictl fails, then exits non-zero
+if no node can provide a status.
 
 Optional environment variables:
   SSH_USER=openpie
@@ -51,7 +52,7 @@ done
 
 command -v ssh >/dev/null 2>&1 || die 'ssh is required'
 
-reachable=0
+failures=()
 for node in "${nodes[@]}"; do
   echo "Checking $cluster_kind cluster through $node ..." >&2
   set +e
@@ -63,19 +64,22 @@ for node in "${nodes[@]}"; do
   set -e
 
   if ((status == 255)); then
+    failures+=("$node: SSH unavailable (exit $status)")
     echo "SSH to $node is unavailable; trying the next node." >&2
     continue
   fi
-  reachable=1
-  printf '%s\n' "$output"
   if ((status != 0)); then
-    echo "ERROR: patronictl status check failed on $node (exit $status)." >&2
-    exit "$status"
+    failures+=("$node: remote status command failed (exit $status)")
+    printf '%s\n' "$output" >&2
+    echo "Status check failed on $node; trying the next node." >&2
+    continue
   fi
+  printf '%s\n' "$output"
   exit 0
 done
 
-if ((reachable == 0)); then
-  echo "ERROR: no node in $conf is reachable; cluster status check is abnormal." >&2
-  exit 1
-fi
+echo "ERROR: unable to obtain $cluster_kind cluster status from any node; status check is abnormal." >&2
+for failure in "${failures[@]}"; do
+  echo "  - $failure" >&2
+done
+exit 1
